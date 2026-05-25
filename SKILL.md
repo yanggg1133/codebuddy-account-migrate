@@ -1,0 +1,211 @@
+---
+name: 账号迁移工具
+description: WorkBuddy 账号切换后一键同步数据，将旧账号的 Session 历史、Memory 记忆、Connector 配置迁移到当前账号。触发关键词：切账号、迁移、同步数据、账号切换、数据丢失、记录没了。
+version: 1.1.0
+agent_created: true
+---
+
+# 账号迁移工具
+
+WorkBuddy 切换账号后，数据通过 `user_id` 隔离，旧账号的 Session、Memory、Connectors 在新账号下不可见。本 Skill 实现一键迁移，将所有历史数据合并到当前登录账号。
+
+## 快速使用
+
+**最简方式（交互式向导，用户无需知道 user_id）：**
+
+```bash
+python3 scripts/migrate.py
+```
+
+运行后自动诊断、列出可选账号、用户输入序号即可。
+
+**其他模式：**
+
+```bash
+python3 scripts/migrate.py --diagnose              # 仅诊断，查看数据分布
+python3 scripts/migrate.py --source <USER_ID>      # 指定源账号迁移（高级用户）
+python3 scripts/migrate.py --rollback <TAG>        # 回滚到指定备份
+```
+
+## 问题背景
+
+WorkBuddy 数据存储架构：**本地优先 + 账号隔离**
+
+| 数据类型 | 存储位置 | 隔离方式 | 切账号后 |
+|:---|:---|:---|:---|
+| Session 历史 | `workbuddy.db` sessions 表 | `user_id` 字段 | ❌ 不可见 |
+| 长期记忆 Memory | `~/.workbuddy/memory/{user_id}_memory.md` | 按文件名 | ❌ 不可见 |
+| Connectors | `~/.workbuddy/connectors/{user_id}/` | 按子目录 | ❌ 不可见 |
+| Skills | `~/.workbuddy/skills/` | 无隔离 | ✅ 可见 |
+| Settings/MCP/Plugins | 全局文件 | 无隔离 | ✅ 可见 |
+| 工作空间 Memory | `{workspace}/.workbuddy/memory/` | 绑定工作空间 | ✅ 可见 |
+
+## 迁移执行流程
+
+### Phase 1：环境诊断
+
+1. 自动读取当前登录 `user_id`（从 `storage.json`，用户无感）
+2. 自动扫描所有已有 `user_id`：
+   - `workbuddy.db` sessions 表：`SELECT DISTINCT user_id FROM sessions`
+   - `~/.workbuddy/memory/` 下的 `*_memory.md` 文件
+   - `~/.workbuddy/connectors/` 下的子目录
+3. 展示对比表格，用户输入序号选择要迁移的源账号（无需知道 user_id）
+
+### Phase 2：备份（必须）
+
+1. 备份 `workbuddy.db`：
+   ```bash
+   cp ~/.workbuddy/workbuddy.db ~/.workbuddy/workbuddy.db.bak.$(date +%Y%m%d%H%M%S)
+   ```
+2. 备份 Memory 文件：
+   ```bash
+   cp ~/.workbuddy/memory/{target_user_id}_memory.md \
+      ~/.workbuddy/memory/{target_user_id}_memory.md.bak.$(date +%Y%m%d%H%M%S)
+   ```
+3. 备份 Connectors：
+   ```bash
+   cp -r ~/.workbuddy/connectors/{target_user_id}/ \
+      ~/.workbuddy/connectors/{target_user_id}.bak.$(date +%Y%m%d%H%M%S)/
+   ```
+
+### Phase 3：执行迁移
+
+#### 3.1 Session 历史迁移
+
+```bash
+python3 -c "
+import sqlite3
+conn = sqlite3.connect('$HOME/.workbuddy/workbuddy.db')
+cur = conn.cursor()
+cur.execute(\"UPDATE sessions SET user_id = '{target_user_id}' WHERE user_id = '{source_user_id}'\")
+print(f'Migrated {cur.rowcount} sessions')
+conn.commit()
+conn.close()
+"
+```
+
+**注意**：
+- 这是**合并**操作，不是覆盖。只改变旧 session 的 user_id，不影响当前账号已有的 session
+- 迁移后旧账号的 session 在 UI 上"消失"，但所有数据归到新账号下可见
+
+#### 3.2 Memory 迁移
+
+Memory 是追加式文本文件，策略是**合并而非覆盖**：
+
+```bash
+python3 -c "
+import os
+home = os.path.expanduser('~')
+src = f'{home}/.workbuddy/memory/{source_user_id}_memory.md'
+dst = f'{home}/.workbuddy/memory/{target_user_id}_memory.md'
+
+if not os.path.exists(src):
+    print('No source memory file, skipping')
+elif not os.path.exists(dst):
+    # 目标不存在，直接复制
+    with open(src) as f: content = f.read()
+    with open(dst, 'w') as f: f.write(content)
+    print('Copied memory (target was empty)')
+else:
+    # 目标已存在，追加去重
+    with open(src) as f: src_content = f.read()
+    with open(dst) as f: dst_content = f.read()
+    # 找出源中有但目标中没有的段落
+    src_lines = set(src_content.strip().split('\n'))
+    dst_lines = set(dst_content.strip().split('\n'))
+    new_lines = [l for l in src_content.strip().split('\n') if l not in dst_lines]
+    if new_lines:
+        with open(dst, 'a') as f:
+            f.write('\n\n## Migrated from {source_user_id}\n\n')
+            f.write('\n'.join(new_lines))
+        print(f'Appended {len(new_lines)} unique lines')
+    else:
+        print('No new content to migrate')
+"
+```
+
+#### 3.3 Connector 配置迁移
+
+Connector 配置是 JSON 文件，策略是**深度合并**（目标没有的 key 从源补充，已有的保留）：
+
+```bash
+python3 -c "
+import json, os, shutil
+home = os.path.expanduser('~')
+src_dir = f'{home}/.workbuddy/connectors/{source_user_id}'
+dst_dir = f'{home}/.workbuddy/connectors/{target_user_id}'
+
+for fname in ['mcp.json', 'connector-states.json']:
+    src_file = os.path.join(src_dir, fname)
+    dst_file = os.path.join(dst_dir, fname)
+    if not os.path.exists(src_file):
+        continue
+    with open(src_file) as f: src_data = json.load(f)
+    if os.path.exists(dst_file):
+        with open(dst_file) as f: dst_data = json.load(f)
+        # 深度合并
+        if isinstance(src_data, dict) and isinstance(dst_data, dict):
+            for k, v in src_data.items():
+                if k not in dst_data:
+                    dst_data[k] = v
+            with open(dst_file, 'w') as f: json.dump(dst_data, f, indent=2)
+            print(f'Merged {fname}')
+        else:
+            # 非字典类型，不覆盖
+            print(f'Skipped {fname} (type conflict)')
+    else:
+        with open(dst_file, 'w') as f: json.dump(src_data, f, indent=2)
+        print(f'Copied {fname}')
+"
+```
+
+### Phase 4：验证
+
+1. 查询 sessions 数量：
+   ```bash
+   python3 -c "
+   import sqlite3
+   conn = sqlite3.connect('$HOME/.workbuddy/workbuddy.db')
+   cur = conn.cursor()
+   cur.execute('SELECT user_id, COUNT(*) FROM sessions GROUP BY user_id')
+   for row in cur.fetchall():
+       print(f'  {row[0]}: {row[1]} sessions')
+   conn.close()
+   "
+   ```
+2. 检查 Memory 文件是否存在且非空
+3. 检查 Connectors 配置是否完整
+
+### Phase 5：收尾
+
+- 告知用户**重启 WorkBuddy 客户端**让变更生效
+- 备份文件保留 7 天，可手动删除
+- 如果迁移有问题，用备份恢复：
+  ```bash
+  cp ~/.workbuddy/workbuddy.db.bak.{timestamp} ~/.workbuddy/workbuddy.db
+  ```
+
+## 踩坑记录
+
+| 坑 | 说明 | 解决 |
+|:---|:---|:---|
+| Session 查询按 user_id 过滤 | UI 层只展示当前 user_id 的 session | UPDATE sessions SET user_id 迁移 |
+| Memory 按文件名隔离 | `{user_id}_memory.md` 命名绑定账号 | 合并内容到新文件 |
+| Connector 按目录隔离 | `connectors/{user_id}/mcp.json` | 深度合并 JSON |
+| automations 表无 user_id | 定时任务不按账号隔离，无需迁移 | 跳过 |
+| Skills 全局共享 | 不按账号隔离 | 无需迁移 |
+| 修改 DB 后需重启 | WorkBuddy 客户端有内存缓存 | 迁移后提示重启 |
+| workbuddy.db 有 WAL 模式 | SQLite WAL 日志可能导致数据不一致 | 迁移前先 checkpoint |
+
+## 安全规则
+
+1. **必须先备份**，Phase 2 不可跳过
+2. **源 user_id 和目标 user_id 必须不同**，防止自我覆盖
+3. **Memory 合并用追加而非覆盖**，避免丢失目标账号已有记忆
+4. **Connector 用深度合并**，保留目标账号已有配置
+5. **迁移完成后提示重启**，确保 UI 刷新缓存
+6. **备份文件 7 天后可手动清理**
+
+## 参考文件
+
+- `references/data_isolation_map.md` — 数据隔离全景图
