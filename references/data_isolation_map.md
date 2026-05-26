@@ -34,7 +34,8 @@
 │   └── {workspace_path}/         # 按工作空间路径，不按账号 ✅
 │
 ├── tasks/                        # 任务列表
-│   └── {session_id}/             # 随 Session 归属账号
+│   └── {session_id}/             # 按 session 归属，新版 UI 不读取 ← 恢复目标
+│       └── {id}.json             # 任务 JSON（subject/description/status等）
 │
 └── logs/                         # 日志，全局共享 ✅
 ```
@@ -54,6 +55,7 @@ cat ~/Library/Application\ Support/WorkBuddy/User/globalStorage/storage.json | \
 | memory | 文件名 | 追加合并 | 🟢 低（文本） |
 | connectors/mcp.json | 子目录 | JSON 深度合并 | 🟡 中（配置） |
 | connectors/states.json | 子目录 | JSON 深度合并 | 🟢 低 |
+| **tasks** | **按 session** | **TaskCreate 重建 / 文件复制** | **🟡 中（新版 UI 不读文件）** |
 | skills | 无 | 不需要迁移 | - |
 | automations | 无 | 不需要迁移 | - |
 | settings/mcp/models | 无 | 不需要迁移 | - |

@@ -1,7 +1,7 @@
 ---
 name: 账号迁移工具
 description: WorkBuddy 账号切换后一键同步数据，将旧账号的 Session 历史、Memory 记忆、Connector 配置迁移到当前账号。触发关键词：切账号、迁移、同步数据、账号切换、数据丢失、记录没了。
-version: 1.1.0
+version: 1.3.0
 agent_created: true
 ---
 
@@ -36,6 +36,7 @@ WorkBuddy 数据存储架构：**本地优先 + 账号隔离**
 | Session 历史 | `workbuddy.db` sessions 表 | `user_id` 字段 | ❌ 不可见 |
 | 长期记忆 Memory | `~/.workbuddy/memory/{user_id}_memory.md` | 按文件名 | ❌ 不可见 |
 | Connectors | `~/.workbuddy/connectors/{user_id}/` | 按子目录 | ❌ 不可见 |
+| **历史任务** | `~/.workbuddy/tasks/{session_id}/*.json` | 按 session | ⚠️ 文件在但 UI 不读 |
 | Skills | `~/.workbuddy/skills/` | 无隔离 | ✅ 可见 |
 | Settings/MCP/Plugins | 全局文件 | 无隔离 | ✅ 可见 |
 | 工作空间 Memory | `{workspace}/.workbuddy/memory/` | 绑定工作空间 | ✅ 可见 |
@@ -44,12 +45,36 @@ WorkBuddy 数据存储架构：**本地优先 + 账号隔离**
 
 ### Phase 1：环境诊断
 
-1. 自动读取当前登录 `user_id`（从 `storage.json`，用户无感）
+1. 自动读取当前登录 `user_id`（**多源交叉验证**，见下方说明）
 2. 自动扫描所有已有 `user_id`：
    - `workbuddy.db` sessions 表：`SELECT DISTINCT user_id FROM sessions`
    - `~/.workbuddy/memory/` 下的 `*_memory.md` 文件
    - `~/.workbuddy/connectors/` 下的子目录
 3. 展示对比表格，用户输入序号选择要迁移的源账号（无需知道 user_id）
+
+**⚠️ 获取当前 user_id 的关键逻辑（v1.3 修复）**：
+
+账号切换后，`storage.json` 中的 `genie.userId` 可能**没有同步更新**，仍为旧 ID。如果脚本误读旧 ID 作为 target，会导致"源=目标，无需迁移"的假象。
+
+修复策略：**优先从 DB 最新 session 推断，而非 storage.json**：
+```python
+# 方法1（最可靠）：DB 中最新创建的 session 的 user_id
+cur.execute("SELECT user_id FROM sessions ORDER BY created_at DESC LIMIT 1")
+
+# 方法2（备选）：storage.json 中的 genie.userId
+data.get("genie.userId", "")
+
+# 两者不一致时，优先用 DB 的值并发出警告
+```
+
+**AI 手动迁移时的最佳实践**：
+
+当 AI 在对话中直接执行迁移（而非运行 migrate.py），应：
+1. 先查询 `SELECT user_id, COUNT(*) FROM sessions GROUP BY user_id` 看分布
+2. 通过当前对话 session 的 user_id 确定目标 ID（最可靠）
+3. **不要**依赖 storage.json 的 genie.userId（可能过时）
+4. 执行 UPDATE 后**必须**做 `PRAGMA wal_checkpoint(TRUNCATE)` 确保持久化
+5. 验证 `SELECT COUNT(*) FROM sessions WHERE user_id = '{旧ID}'` 确认归零
 
 ### Phase 2：备份（必须）
 
@@ -77,9 +102,27 @@ python3 -c "
 import sqlite3
 conn = sqlite3.connect('$HOME/.workbuddy/workbuddy.db')
 cur = conn.cursor()
+
+# 迁移前 WAL checkpoint
+cur.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+
+# 执行迁移
 cur.execute(\"UPDATE sessions SET user_id = '{target_user_id}' WHERE user_id = '{source_user_id}'\")
 print(f'Migrated {cur.rowcount} sessions')
 conn.commit()
+
+# 迁移后 WAL checkpoint（确保持久化）
+cur.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+print(f'WAL checkpoint: {cur.fetchone()}')
+
+# 验证源 user_id 归零
+cur.execute(\"SELECT COUNT(*) FROM sessions WHERE user_id = '{source_user_id}'\")
+remaining = cur.fetchone()[0]
+if remaining > 0:
+    print(f'⚠️ 警告：源账号仍有 {remaining} 个 session 未迁移！')
+else:
+    print('✅ 验证通过：源账号 session 已全部迁移')
+
 conn.close()
 "
 ```
@@ -185,6 +228,68 @@ for fname in ['mcp.json', 'connector-states.json']:
   cp ~/.workbuddy/workbuddy.db.bak.{timestamp} ~/.workbuddy/workbuddy.db
   ```
 
+### Phase 6：历史任务恢复（新版兼容）
+
+**问题**：新版 WorkBuddy 的 `/todos` 面板只读取当前 session 的内存数据，不会扫描 `~/.workbuddy/tasks/` 下的历史 JSON 文件。迁移后这些任务文件虽然还在磁盘上，但 UI 不可见。
+
+**诊断**：
+
+```bash
+python3 scripts/migrate.py --list-tasks
+```
+
+输出示例：
+```
+📋 7e46a1bb... | WorkBuddy会议纪要生成与账号迁移工具开发
+   13 个任务: 12 完成 / 1 待办
+   🔲 待办: 调研 WorkBuddy 数据存储与账号切换机制
+```
+
+**恢复方式一：AI 直接用 TaskCreate 创建（推荐）**
+
+这是最可靠的方式，因为 TaskCreate 创建的任务会立即出现在 `/todos` 面板：
+
+```bash
+python3 scripts/migrate.py --restore-tasks --generate-commands
+```
+
+会生成每个 pending 任务的 TaskCreate 参数 JSON，将它们逐个传给 AI 的 TaskCreate 工具即可。
+
+**恢复方式二：写入文件系统**
+
+将历史任务文件复制到当前 session 的 tasks 目录：
+
+```bash
+# 恢复所有 pending 任务
+python3 scripts/migrate.py --restore-tasks
+
+# 恢复指定 session 的全部任务（含 completed）
+python3 scripts/migrate.py --restore-tasks --session <SESSION_ID>
+```
+
+⚠️ 此方式写入文件后需要重启编辑器才可能生效，且新版 UI 可能仍不读取这些文件。
+
+**恢复方式三：在对话中直接执行（最推荐）**
+
+当用户报告"任务记录丢失"时，AI 应：
+
+1. 先用 `--list-tasks` 诊断历史任务
+2. 读取 `~/.workbuddy/tasks/` 下各 session 的 JSON 文件
+3. 对每个 pending 任务，使用 TaskCreate 工具在当前 session 中重新创建
+4. 告知用户任务已恢复
+
+示例：
+```python
+# 读取历史任务
+import json, glob
+for f in glob.glob(os.path.expanduser("~/.workbuddy/tasks/*/*.json")):
+    with open(f) as fh:
+        task = json.load(fh)
+    if task.get("status") == "pending":
+        # 使用 TaskCreate 工具创建
+        pass
+```
+
 ## 踩坑记录
 
 | 坑 | 说明 | 解决 |
@@ -196,6 +301,12 @@ for fname in ['mcp.json', 'connector-states.json']:
 | Skills 全局共享 | 不按账号隔离 | 无需迁移 |
 | 修改 DB 后需重启 | WorkBuddy 客户端有内存缓存 | 迁移后提示重启 |
 | workbuddy.db 有 WAL 模式 | SQLite WAL 日志可能导致数据不一致 | 迁移前先 checkpoint |
+| 迁移中创建的会话 user_id 不匹配 | 迁移脚本运行时，当前对话可能以旧 user_id 写入 sessions 表 | Phase 4 验证后追加检查：`SELECT COUNT(*) FROM sessions WHERE user_id NOT IN (target)` 并修复 |
+| **历史任务 UI 不可见** | **新版 /todos 只读当前 session 内存，不扫描 `tasks/` 目录** | **AI 用 TaskCreate 工具重新创建 pending 任务** |
+| **tasks 文件格式兼容** | **旧版任务 JSON 有 subject/description/status 等字段，新版 TaskCreate 参数格式一致** | **字段可直接映射** |
+| **storage.json 中 genie.userId 过时** | **账号切换后 storage.json 的 genie.userId 可能没有同步更新，仍为旧 ID。迁移脚本读到旧 ID 作为 target，导致 source=target 跳过迁移** | **v1.3 修复：优先从 DB 最新 session 推断 user_id，交叉验证不一致时发出警告** |
+| **WAL 未 checkpoint 导致迁移丢失** | **即使 UPDATE sessions 成功 + commit，如果 WAL 日志没有 checkpoint，客户端重启后可能读不到修改，数据恢复为旧状态** | **v1.3 修复：迁移前后各做一次 PRAGMA wal_checkpoint(TRUNCATE)，并验证源 user_id 归零** |
+| **AI 手动迁移时的常见错误** | **AI 在对话中直接写 SQL 迁移时，可能：(1) 从 storage.json 读到错误的 target_uid (2) 忘记 WAL checkpoint (3) 不验证结果** | **必须：(1) 从当前对话 session 的 user_id 确定目标 (2) UPDATE 后做 WAL checkpoint (3) 验证源 user_id 归零** |
 
 ## 安全规则
 

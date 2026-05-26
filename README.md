@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Platform: macOS](https://img.shields.io/badge/Platform-macOS-blue.svg)](https://www.apple.com/macos)
 [![Python 3.8+](https://img.shields.io/badge/Python-3.8+-green.svg)](https://www.python.org/)
-[![Version 1.1.0](https://img.shields.io/badge/Version-1.1.0-brightgreen.svg)](https://github.com/yourname/workbuddy-account-migrate)
+[![Version 1.3.0](https://img.shields.io/badge/Version-1.3.0-brightgreen.svg)](https://github.com/xiaoliuzhuan666/workbuddy-account-migrate)
 
 **[English](#english) | [中文](#chinese)**
 
@@ -50,13 +50,15 @@ WorkBuddy 切换账号 / 重新登录 / 换了腾讯云身份后，**之前的�
 | ✅ Memory 长期记忆合并 | 追加式去重合并，不会丢失当前账号已有记忆 |
 | ✅ Connector MCP 连接器合并 | JSON 深度合并，目标账号已有配置保留不动 |
 | ✅ 自动备份 + 回滚 | 迁移前自动备份数据库、记忆、连接器，支持一键回滚 |
-| ✅ WAL 安全处理 | 迁移前执行 SQLite checkpoint，避免数据不一致 |
+| ✅ WAL 安全处理 | 迁移前后执行 SQLite checkpoint，确保数据持久化 |
+| ✅ 多源 user_id 验证 | v1.3：从 DB 最新 session 和 storage.json 交叉验证，避免过时 ID 导致迁移失败 |
+| ✅ 迁移结果验证 | v1.3：UPDATE 后验证源 user_id 归零，确认迁移成功 |
 | ✅ 零依赖 | 仅需 Python 3.8+，无第三方包 |
 
 ### 快速开始
 
 ```bash
-git clone https://github.com/yourname/workbuddy-account-migrate.git
+git clone https://github.com/xiaoliuzhuan666/workbuddy-account-migrate.git
 cd workbuddy-account-migrate
 python3 scripts/migrate.py
 ```
@@ -108,13 +110,15 @@ python3 scripts/migrate.py --rollback <TAG>
 
 ### 工作原理
 
-**Step 1：自动诊断** — 从数据库、Memory 文件、Connector 目录三个来源自动发现所有账号，当前登录账号通过读取 `storage.json` 自动获取。
+**Step 1：自动诊断** — 从数据库、Memory 文件、Connector 目录三个来源自动发现所有账号。当前登录账号通过**多源交叉验证**自动获取（DB 最新 session user_id + storage.json 的 genie.userId，不一致时优先使用 DB 值并发出警告）。
 
 **Step 2：安全备份** — 迁移前自动备份到 `~/.workbuddy/migrate_backups/{timestamp}_{uid}/`
 
 **Step 3：执行迁移** — Session 用 `UPDATE user_id`，Memory 逐行去重追加，Connector JSON 深度合并
 
-**Step 4：验证 + 重启提示** — 迁移后验证 session 数量变化，提示重启 WorkBuddy 客户端
+**Step 4：持久化 + 验证** — 迁移后执行 WAL checkpoint 确保数据落盘，验证源 user_id 归零确认迁移成功
+
+**Step 5：重启提示** — 提示重启 WorkBuddy 客户端，UI 刷新缓存后数据可见
 
 ### 兼容性
 
@@ -192,9 +196,31 @@ workbuddy-account-migrate/
 
 ### 贡献
 
-- Bug 报告 / 功能请求 → [Issues](https://github.com/yourname/workbuddy-account-migrate/issues)
+- Bug 报告 / 功能请求 → [Issues](https://github.com/xiaoliuzhuan666/workbuddy-account-migrate/issues)
 - 代码贡献 → 提交 PR，请确保无硬编码的 user_id 或 Token
 - 平台适配（Windows/Linux）→ 欢迎 PR
+
+### 更新日志
+
+#### v1.3.0 (2026-05-26)
+
+**关键修复：账号切换后 storage.json 中 genie.userId 未同步，导致迁移被静默跳过**
+
+- **Bug 修复**：`get_current_user_id()` 改为多源交叉验证——同时从 DB 最新 session 和 storage.json 读取 user_id，不一致时警告并优先使用 DB 值。此前仅依赖 `genie.userId`，账号切换后可能过时，导致 source=target 迁移被跳过。
+- **Bug 修复**：`migrate_sessions()` 迁移后增加 WAL checkpoint + 验证源 user_id 归零。此前修改可能因 WAL 未落盘而在客户端重启后丢失。
+- **文档更新**：SKILL.md 新增 AI 手动迁移最佳实践、3 条新踩坑记录。
+
+#### v1.2.0 (2026-05-25)
+
+- 新增历史任务恢复（`--list-tasks`、`--restore-tasks`）
+- 新增交互式向导模式
+- 新增 `--generate-commands` 生成 TaskCreate 命令
+
+#### v1.1.0 (2026-05-25)
+
+- 首次公开发布
+- Session、Memory、Connector 迁移
+- 自动备份 + 回滚
 
 ### License
 
@@ -213,7 +239,7 @@ This tool merges old account data into your current account with a single comman
 ### Quick Start
 
 ```bash
-git clone https://github.com/yourname/workbuddy-account-migrate.git
+git clone https://github.com/xiaoliuzhuan666/workbuddy-account-migrate.git
 cd workbuddy-account-migrate
 python3 scripts/migrate.py
 ```
@@ -233,8 +259,9 @@ Skills, Automations, Settings are global (no user_id) — no migration needed.
 ### Features
 
 - 🧙 Interactive wizard (no user_id needed)
-- 💾 Auto-backup before migration + rollback support
-- 🔒 Safe: append-only memory, deep-merge connectors, WAL checkpoint
+- 🔒 Safe: append-only memory, deep-merge connectors, WAL checkpoint before & after
+- 🔍 Multi-source user_id validation (DB + storage.json cross-check)
+- ✅ Post-migration verification (source user_id must be zero)
 - 🪶 Zero dependencies (Python 3.8+ only)
 
 ### Compatibility
@@ -242,6 +269,29 @@ Skills, Automations, Settings are global (no user_id) — no migration needed.
 - ✅ WorkBuddy macOS (tested)
 - ⚠️ Windows/Linux (path adaptation needed, PRs welcome)
 - ❌ CodeBuddy CLI (not needed — it uses project-level isolation, not user-level)
+
+### Changelog
+
+#### v1.3.0 (2026-05-26)
+
+**Critical fix: Migration was silently skipped due to stale user_id**
+
+- **Bug fix**: `get_current_user_id()` now uses multi-source cross-validation — reads from both DB latest session and `storage.json`, warns when inconsistent, prioritizes DB value. Previously relied solely on `genie.userId` which could be stale after account switch, causing `source == target` and migration being skipped.
+- **Bug fix**: `migrate_sessions()` now performs WAL checkpoint after UPDATE (not just before), and verifies source user_id is zero. Previously, modifications could be lost on client restart due to unflushed WAL logs.
+- **SKILL.md**: Added AI manual migration best practices, 3 new troubleshooting entries.
+- **README**: Updated feature list, workflow description, and version badge.
+
+#### v1.2.0 (2026-05-25)
+
+- Added task history recovery (`--list-tasks`, `--restore-tasks`)
+- Added interactive wizard mode
+- Added `--generate-commands` for TaskCreate tool
+
+#### v1.1.0 (2026-05-25)
+
+- Initial public release
+- Session, Memory, Connector migration
+- Auto-backup + rollback support
 
 ### License
 

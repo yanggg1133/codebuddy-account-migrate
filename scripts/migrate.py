@@ -9,6 +9,9 @@ WorkBuddy 账号迁移工具
   python3 migrate.py --source USER_ID          # 指定源账号迁移（高级用户）
   python3 migrate.py --source USER_ID --yes    # 跳过确认直接迁移
   python3 migrate.py --rollback TIMESTAMP      # 回滚到指定备份
+  python3 migrate.py --restore-tasks           # 恢复历史任务到当前 session
+  python3 migrate.py --restore-tasks --session SESSION_ID  # 恢复指定 session 的任务
+  python3 migrate.py --list-tasks              # 列出所有历史任务概览
 """
 
 import argparse
@@ -24,6 +27,7 @@ WORKBUDDY_DIR = Path.home() / ".workbuddy"
 DB_PATH = WORKBUDDY_DIR / "workbuddy.db"
 MEMORY_DIR = WORKBUDDY_DIR / "memory"
 CONNECTORS_DIR = WORKBUDDY_DIR / "connectors"
+TASKS_DIR = WORKBUDDY_DIR / "tasks"
 STORAGE_JSON = Path.home() / "Library" / "Application Support" / "WorkBuddy" / "User" / "globalStorage" / "storage.json"
 
 # 备份目录
@@ -31,14 +35,54 @@ BACKUP_DIR = WORKBUDDY_DIR / "migrate_backups"
 
 
 def get_current_user_id():
-    """获取当前登录的 user_id"""
+    """获取当前登录的 user_id
+
+    优先级策略（解决 storage.json 中 genie.userId 与实际运行时 user_id 不一致的问题）：
+    1. 从 workbuddy.db 中最新 session 的 user_id 推断（最可靠）
+    2. 从 storage.json 的 genie.userId 读取（可能过时）
+    3. 如果两者不一致，发出警告并使用 DB 中的值
+    """
+    db_uid = ""
+    storage_uid = ""
+
+    # 方法1：从 DB 最新 session 推断（最可靠）
+    if DB_PATH.exists():
+        try:
+            conn = sqlite3.connect(str(DB_PATH))
+            cur = conn.cursor()
+            cur.execute("SELECT user_id FROM sessions ORDER BY created_at DESC LIMIT 1")
+            row = cur.fetchone()
+            conn.close()
+            if row and row[0]:
+                db_uid = row[0]
+        except Exception:
+            pass
+
+    # 方法2：从 storage.json 读取
     try:
         with open(STORAGE_JSON) as f:
             data = json.load(f)
-        return data.get("genie.userId", "")
-    except Exception as e:
-        print(f"❌ 无法读取当前 user_id: {e}")
-        return ""
+        storage_uid = data.get("genie.userId", "")
+    except Exception:
+        pass
+
+    # 交叉验证
+    if db_uid and storage_uid and db_uid != storage_uid:
+        print(f"⚠️  检测到 user_id 不一致！")
+        print(f"   storage.json (genie.userId): {storage_uid}")
+        print(f"   DB 最新 session user_id:      {db_uid}")
+        print(f"   → 优先使用 DB 最新 session 的 user_id: {db_uid}")
+        print()
+        return db_uid
+
+    if db_uid:
+        return db_uid
+
+    if storage_uid:
+        return storage_uid
+
+    print("❌ 无法获取当前 user_id（DB 和 storage.json 均无数据）")
+    return ""
 
 
 def get_all_user_ids():
@@ -216,7 +260,7 @@ def migrate_sessions(source_uid, target_uid):
     conn = sqlite3.connect(str(DB_PATH))
     cur = conn.cursor()
 
-    # 先 checkpoint WAL
+    # 先 checkpoint WAL（确保读取到最新数据）
     cur.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     # 统计
@@ -232,6 +276,20 @@ def migrate_sessions(source_uid, target_uid):
     cur.execute("UPDATE sessions SET user_id = ? WHERE user_id = ?", (target_uid, source_uid))
     migrated = cur.rowcount
     conn.commit()
+
+    # 迁移后再 checkpoint WAL（确保写入持久化）
+    cur.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    checkpoint_result = cur.fetchone()
+    print(f"  📋 WAL checkpoint: {checkpoint_result}")
+
+    # 验证：确认源账号不再有 session
+    cur.execute("SELECT COUNT(*) FROM sessions WHERE user_id = ?", (source_uid,))
+    remaining = cur.fetchone()[0]
+    if remaining > 0:
+        print(f"  ⚠️  警告：源账号仍有 {remaining} 个 session 未迁移！")
+    else:
+        print(f"  ✅ 验证通过：源账号 session 已全部迁移")
+
     conn.close()
 
     print(f"  ✅ 迁移 {migrated} 个 session（{source_uid[:12]}... → {target_uid[:12]}...）")
@@ -526,12 +584,330 @@ def interactive_migrate():
     migrate(source_uid)
 
 
+def get_task_stats():
+    """获取 tasks 目录下所有历史任务的统计信息"""
+    stats = {}
+    if not TASKS_DIR.exists():
+        return stats
+
+    for session_dir in sorted(TASKS_DIR.iterdir()):
+        if not session_dir.is_dir():
+            continue
+        session_id = session_dir.name
+        tasks = []
+        for task_file in sorted(session_dir.glob("*.json")):
+            try:
+                with open(task_file, encoding="utf-8") as f:
+                    task_data = json.load(f)
+                tasks.append(task_data)
+            except Exception:
+                pass
+        if tasks:
+            stats[session_id] = tasks
+    return stats
+
+
+def get_session_title(session_id):
+    """根据 session_id 查询 session 标题"""
+    if not DB_PATH.exists():
+        return None
+    try:
+        conn = sqlite3.connect(str(DB_PATH))
+        cur = conn.cursor()
+        cur.execute("SELECT title FROM sessions WHERE id = ?", (session_id,))
+        row = cur.fetchone()
+        conn.close()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
+def list_tasks():
+    """列出所有历史任务概览"""
+    stats = get_task_stats()
+
+    if not stats:
+        print("❌ 没有发现任何历史任务数据")
+        print(f"   检查路径: {TASKS_DIR}")
+        return
+
+    print("=" * 70)
+    print("WorkBuddy 历史任务概览")
+    print("=" * 70)
+    print()
+
+    total_tasks = 0
+    total_pending = 0
+    total_completed = 0
+
+    for session_id, tasks in stats.items():
+        title = get_session_title(session_id) or "(未知 session)"
+        # 截断过长的标题
+        if len(title) > 50:
+            title = title[:47] + "..."
+        completed = sum(1 for t in tasks if t.get("status") == "completed")
+        pending = sum(1 for t in tasks if t.get("status") == "pending")
+        other = len(tasks) - completed - pending
+
+        total_tasks += len(tasks)
+        total_completed += completed
+        total_pending += pending
+
+        print(f"  📋 {session_id[:8]}... | {title}")
+        print(f"     {len(tasks)} 个任务: {completed} 完成 / {pending} 待办" + (f" / {other} 其他" if other else ""))
+
+        # 列出待办任务详情
+        for t in tasks:
+            if t.get("status") == "pending":
+                print(f"     🔲 待办: {t.get('subject', '(无标题)')}")
+
+    print()
+    print(f"  📊 总计: {len(stats)} 个 session, {total_tasks} 个任务")
+    print(f"     {total_completed} 完成 / {total_pending} 待办")
+    print()
+
+
+def restore_tasks(target_session_id=None, skip_confirm=False):
+    """恢复历史任务数据
+
+    将 ~/.workbuddy/tasks/ 下的历史任务文件重新创建到当前 session 中。
+    新版 WorkBuddy 的 /todos 面板只显示当前 session 的内存任务，
+    此功能通过 TaskCreate 工具将历史任务逐条恢复。
+
+    策略:
+    1. 如果指定了 --session，只恢复该 session 的任务
+    2. 否则恢复所有 session 中的 pending（待办）任务
+    3. 已 completed 的任务默认不恢复，除非加 --include-completed
+    """
+    stats = get_task_stats()
+
+    if not stats:
+        print("❌ 没有发现任何历史任务数据")
+        print(f"   检查路径: {TASKS_DIR}")
+        return
+
+    # 确定要恢复哪些 session 的任务
+    if target_session_id:
+        if target_session_id not in stats:
+            print(f"❌ 指定的 session 不存在任务数据: {target_session_id}")
+            # 模糊匹配
+            matches = [s for s in stats if s.startswith(target_session_id)]
+            if matches:
+                print(f"   可能的匹配: {matches}")
+            return
+        target_stats = {target_session_id: stats[target_session_id]}
+    else:
+        target_stats = stats
+
+    # 收集要恢复的任务
+    tasks_to_restore = []
+    for session_id, tasks in target_stats.items():
+        for task in tasks:
+            # 默认只恢复 pending 的任务
+            if task.get("status") == "pending":
+                tasks_to_restore.append({
+                    "source_session": session_id,
+                    "task": task,
+                })
+            elif target_session_id:
+                # 指定了 session 时，恢复所有状态的任务
+                tasks_to_restore.append({
+                    "source_session": session_id,
+                    "task": task,
+                })
+
+    if not tasks_to_restore:
+        print("⚠️  没有找到需要恢复的任务")
+        if not target_session_id:
+            print("   提示: 默认只恢复 pending（待办）状态的任务")
+            print("   如需恢复指定 session 的全部任务，使用 --session <SESSION_ID>")
+        return
+
+    # 展示待恢复任务
+    print("=" * 70)
+    print("WorkBuddy 历史任务恢复")
+    print("=" * 70)
+    print()
+
+    for i, item in enumerate(tasks_to_restore, 1):
+        task = item["task"]
+        status_icon = "✅" if task.get("status") == "completed" else "🔲"
+        src_session = item["source_session"][:8]
+        print(f"  {i}. {status_icon} [{task.get('status', '?')}] {task.get('subject', '(无标题)')}")
+        desc = task.get("description", "")
+        if desc:
+            desc_short = desc[:80] + "..." if len(desc) > 80 else desc
+            print(f"     {desc_short}")
+        print(f"     来源: session {src_session}... | ID: {task.get('id', '?')}")
+
+    print()
+    print(f"  共 {len(tasks_to_restore)} 个任务待恢复")
+
+    if not skip_confirm:
+        answer = input("\n确认恢复？(y/N): ").strip().lower()
+        if answer != "y":
+            print("已取消")
+            return
+
+    # 执行恢复：将任务写入当前 session 的 tasks 目录
+    # 首先获取当前 session ID
+    current_session_id = None
+
+    # 方法1: 从 sessions.json 获取当前活跃 session
+    sessions_dir = WORKBUDDY_DIR / "sessions"
+    if sessions_dir.exists():
+        for session_file in sorted(sessions_dir.glob("*.json"), key=lambda f: f.stat().st_mtime, reverse=True):
+            try:
+                with open(session_file, encoding="utf-8") as f:
+                    session_data = json.load(f)
+                if session_data.get("kind") == "interactive" and session_data.get("sessionId"):
+                    current_session_id = session_data["sessionId"]
+                    if not current_session_id.startswith("interactive-"):
+                        break  # 优先使用非 interactive- 的真实 session ID
+            except Exception:
+                pass
+
+    # 方法2: 从 workbuddy.db 获取最新的 working session
+    if not current_session_id and DB_PATH.exists():
+        try:
+            conn = sqlite3.connect(str(DB_PATH))
+            cur = conn.cursor()
+            cur.execute("SELECT id FROM sessions WHERE status = 'working' ORDER BY created_at DESC LIMIT 1")
+            row = cur.fetchone()
+            conn.close()
+            if row:
+                current_session_id = row[0]
+        except Exception:
+            pass
+
+    if not current_session_id:
+        print("❌ 无法获取当前 session ID")
+        print("   请在 WorkBuddy 对话中执行此操作")
+        return
+
+    print(f"\n  当前 session: {current_session_id}")
+
+    # 将任务写入当前 session 的 tasks 目录
+    current_tasks_dir = TASKS_DIR / current_session_id
+    current_tasks_dir.mkdir(exist_ok=True)
+
+    # 找出当前 session 已有的最大任务 ID
+    existing_ids = []
+    for f in current_tasks_dir.glob("*.json"):
+        try:
+            existing_ids.append(int(f.stem))
+        except ValueError:
+            pass
+    next_id = max(existing_ids, default=0) + 1
+
+    restored_count = 0
+    for item in tasks_to_restore:
+        task = item["task"]
+        # 创建新的任务 JSON，更新 ID
+        new_task = {
+            "subject": task.get("subject", ""),
+            "description": task.get("description", ""),
+            "activeForm": task.get("activeForm", task.get("subject", "")),
+            "status": task.get("status", "pending"),
+            "id": str(next_id),
+            "createdAt": task.get("createdAt", int(datetime.now().timestamp() * 1000)),
+            "updatedAt": int(datetime.now().timestamp() * 1000),
+            "metadata": {
+                "restored_from_session": item["source_session"],
+                "restored_from_task_id": task.get("id", ""),
+                "restored_at": datetime.now().isoformat(),
+            }
+        }
+
+        task_file = current_tasks_dir / f"{next_id}.json"
+        with open(task_file, "w", encoding="utf-8") as f:
+            json.dump(new_task, f, indent=2, ensure_ascii=False)
+
+        next_id += 1
+        restored_count += 1
+        status_icon = "✅" if new_task["status"] == "completed" else "🔲"
+        print(f"  {status_icon} 恢复: {new_task['subject']} → {task_file.name}")
+
+    print()
+    print("=" * 70)
+    print("任务恢复完成！")
+    print("=" * 70)
+    print(f"\n  📊 已恢复 {restored_count} 个任务到 session {current_session_id[:12]}...")
+    print(f"  📁 任务文件: {current_tasks_dir}")
+    print()
+    print("  ⚠️  注意：")
+    print("     - 新版 WorkBuddy 的 /todos 面板可能仍不会显示这些任务")
+    print("     - 这是因为 /todos 读取的是当前 session 的内存数据，而非文件系统")
+    print("     - 恢复后的任务文件已写入磁盘，重启编辑器后可能生效")
+    print("     - 如需在当前对话中使用这些任务，请告知 AI 读取这些 JSON 文件")
+    print()
+    print("  💡 替代方案：")
+    print("     在当前对话中让 AI 使用 TaskCreate 工具重新创建这些任务")
+    print("     这样 /todos 面板就能立即显示")
+
+
+def generate_task_create_commands(target_session_id=None):
+    """生成 TaskCreate 工具的 JSON 命令，供 AI 在当前对话中执行
+
+    这是恢复任务最可靠的方式：直接让 AI 在当前 session 中用 TaskCreate 创建任务，
+    这样 /todos 面板能立即显示。
+    """
+    stats = get_task_stats()
+
+    if not stats:
+        print("❌ 没有发现任何历史任务数据")
+        return
+
+    # 确定要恢复哪些任务
+    if target_session_id:
+        if target_session_id not in stats:
+            print(f"❌ 指定的 session 不存在任务数据: {target_session_id}")
+            return
+        target_stats = {target_session_id: stats[target_session_id]}
+    else:
+        target_stats = stats
+
+    # 收集 pending 任务
+    tasks_to_restore = []
+    for session_id, tasks in target_stats.items():
+        for task in tasks:
+            if task.get("status") == "pending":
+                tasks_to_restore.append(task)
+
+    if not tasks_to_restore:
+        print("⚠️  没有找到 pending 状态的任务")
+        print("   如需恢复指定 session 的全部任务，使用 --session <SESSION_ID>")
+        return
+
+    print("=" * 70)
+    print("TaskCreate 命令生成（供 AI 在当前对话中执行）")
+    print("=" * 70)
+    print()
+    print(f"共 {len(tasks_to_restore)} 个待恢复的 pending 任务：\n")
+
+    for i, task in enumerate(tasks_to_restore, 1):
+        print(f"--- 任务 {i} ---")
+        cmd = {
+            "subject": task.get("subject", ""),
+            "description": task.get("description", ""),
+            "activeForm": task.get("activeForm", task.get("subject", "")),
+        }
+        print(json.dumps(cmd, ensure_ascii=False, indent=2))
+        print()
+
+    print("💡 将以上 JSON 逐个传给 TaskCreate 工具即可在当前 session 中创建任务")
+
+
 def main():
     parser = argparse.ArgumentParser(description="WorkBuddy 账号迁移工具")
     parser.add_argument("--diagnose", "-d", action="store_true", help="诊断模式：查看所有账号数据分布")
     parser.add_argument("--source", "-s", type=str, help="源账号 user_id（要迁移出的账号）")
     parser.add_argument("--yes", "-y", action="store_true", help="跳过确认直接迁移")
     parser.add_argument("--rollback", "-r", type=str, help="回滚到指定备份标签")
+    parser.add_argument("--restore-tasks", action="store_true", help="恢复历史任务到当前 session")
+    parser.add_argument("--list-tasks", action="store_true", help="列出所有历史任务概览")
+    parser.add_argument("--session", type=str, help="指定要恢复任务的 session ID")
+    parser.add_argument("--generate-commands", action="store_true", help="生成 TaskCreate 命令（与 --restore-tasks 配合使用）")
 
     args = parser.parse_args()
 
@@ -539,6 +915,13 @@ def main():
         diagnose()
     elif args.rollback:
         rollback(args.rollback)
+    elif args.list_tasks:
+        list_tasks()
+    elif args.restore_tasks:
+        if args.generate_commands:
+            generate_task_create_commands(target_session_id=args.session)
+        else:
+            restore_tasks(target_session_id=args.session, skip_confirm=args.yes)
     elif args.source:
         migrate(args.source, skip_confirm=args.yes)
     else:
