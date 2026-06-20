@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 WorkBuddy 账号迁移工具
 将旧账号的 Session、Memory、Connector 数据迁移到当前登录账号
@@ -17,9 +18,17 @@ WorkBuddy 账号迁移工具
 import argparse
 import json
 import os
+import platform
+import sys
+
+# Windows 终端可能使用 GBK/CP936 编码，强制 stdout/stderr 为 UTF-8 避免 emoji 崩溃
+if platform.system() == "Windows":
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+
 import shutil
 import sqlite3
-import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -28,7 +37,24 @@ DB_PATH = WORKBUDDY_DIR / "workbuddy.db"
 MEMORY_DIR = WORKBUDDY_DIR / "memory"
 CONNECTORS_DIR = WORKBUDDY_DIR / "connectors"
 TASKS_DIR = WORKBUDDY_DIR / "tasks"
-STORAGE_JSON = Path.home() / "Library" / "Application Support" / "WorkBuddy" / "User" / "globalStorage" / "storage.json"
+
+# storage.json 路径：跨平台支持
+def _get_storage_json_path():
+    import platform
+    system = platform.system()
+    if system == "Darwin":
+        return Path.home() / "Library" / "Application Support" / "WorkBuddy" / "User" / "globalStorage" / "storage.json"
+    elif system == "Windows":
+        appdata = os.environ.get("APPDATA", "")
+        if appdata:
+            return Path(appdata) / "WorkBuddy" / "User" / "globalStorage" / "storage.json"
+        return Path.home() / "AppData" / "Roaming" / "WorkBuddy" / "User" / "globalStorage" / "storage.json"
+    else:
+        # Linux / 其他
+        config_home = os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
+        return Path(config_home) / "WorkBuddy" / "User" / "globalStorage" / "storage.json"
+
+STORAGE_JSON = _get_storage_json_path()
 
 # 备份目录
 BACKUP_DIR = WORKBUDDY_DIR / "migrate_backups"
@@ -37,20 +63,36 @@ BACKUP_DIR = WORKBUDDY_DIR / "migrate_backups"
 def get_current_user_id():
     """获取当前登录的 user_id
 
-    优先级策略（解决 storage.json 中 genie.userId 与实际运行时 user_id 不一致的问题）：
-    1. 从 workbuddy.db 中最新 session 的 user_id 推断（最可靠）
-    2. 从 storage.json 的 genie.userId 读取（可能过时）
-    3. 如果两者不一致，发出警告并使用 DB 中的值
+    优先级策略：
+    1. 从 storage.json 的 genie.userId 读取（登录态的权威来源）
+    2. 从 workbuddy.db 中 session 数量最多的 user_id 推断（辅助验证）
+    3. 如果两者不一致，优先使用 storage.json，并发出警告
+
+    ⚠️  注意：不能用"最新 session"来判断当前账号！
+    因为旧账号在切换前的最后一条 session 可能比当前账号的 session 更新，
+    导致误把旧账号当成当前账号。
     """
     db_uid = ""
     storage_uid = ""
 
-    # 方法1：从 DB 最新 session 推断（最可靠）
+    # 方法1：从 storage.json 读取（最权威，代表实际登录状态）
+    try:
+        with open(STORAGE_JSON, encoding="utf-8") as f:
+            data = json.load(f)
+        storage_uid = data.get("genie.userId", "")
+    except Exception:
+        pass
+
+    # 方法2：从 DB 推断——用 session 数量最多的 user_id（而非最新 session）
+    # 避免被偶发的旧账号 session 欺骗
     if DB_PATH.exists():
         try:
             conn = sqlite3.connect(str(DB_PATH))
             cur = conn.cursor()
-            cur.execute("SELECT user_id FROM sessions ORDER BY created_at DESC LIMIT 1")
+            cur.execute(
+                "SELECT user_id, COUNT(*) as cnt FROM sessions "
+                "WHERE user_id IS NOT NULL GROUP BY user_id ORDER BY cnt DESC LIMIT 1"
+            )
             row = cur.fetchone()
             conn.close()
             if row and row[0]:
@@ -58,30 +100,21 @@ def get_current_user_id():
         except Exception:
             pass
 
-    # 方法2：从 storage.json 读取
-    try:
-        with open(STORAGE_JSON) as f:
-            data = json.load(f)
-        storage_uid = data.get("genie.userId", "")
-    except Exception:
-        pass
-
     # 交叉验证
-    if db_uid and storage_uid and db_uid != storage_uid:
+    if storage_uid and db_uid and storage_uid != db_uid:
         print(f"⚠️  检测到 user_id 不一致！")
         print(f"   storage.json (genie.userId): {storage_uid}")
-        print(f"   DB 最新 session user_id:      {db_uid}")
-        print(f"   → 优先使用 DB 最新 session 的 user_id: {db_uid}")
+        print(f"   DB session 数最多的 user_id: {db_uid}")
+        print(f"   → 优先使用 storage.json 的 user_id（登录态权威）: {storage_uid}")
         print()
-        return db_uid
-
-    if db_uid:
-        return db_uid
 
     if storage_uid:
         return storage_uid
 
-    print("❌ 无法获取当前 user_id（DB 和 storage.json 均无数据）")
+    if db_uid:
+        return db_uid
+
+    print("❌ 无法获取当前 user_id（storage.json 和 DB 均无数据）")
     return ""
 
 
@@ -392,11 +425,16 @@ def migrate_connectors(source_uid, target_uid):
             print(f"  ✅ 复制 {fname}（目标不存在）")
 
 
-def migrate(source_uid, skip_confirm=False):
-    """执行完整迁移流程"""
-    target_uid = get_current_user_id()
+def migrate(source_uid, target_uid=None, skip_confirm=False):
+    """执行完整迁移流程
+
+    target_uid: 目标账号 ID。如果为 None，则自动从 storage.json/DB 推断。
+    """
+    if target_uid is None:
+        target_uid = get_current_user_id()
     if not target_uid:
-        print("❌ 无法获取当前登录 user_id，请确认 WorkBuddy 已登录")
+        print("❌ 无法获取目标账号 user_id，请确认 WorkBuddy 已登录")
+        print("   也可使用 --target <USER_ID> 手动指定目标账号")
         sys.exit(1)
 
     if source_uid == target_uid:
@@ -522,49 +560,70 @@ def rollback(backup_tag):
 
 
 def interactive_migrate():
-    """交互式迁移向导：自动诊断，用户选序号即可"""
-    current_uid = get_current_user_id()
-    if not current_uid:
-        print("❌ 无法获取当前登录 user_id，请确认 WorkBuddy 已登录")
-        sys.exit(1)
-
+    """交互式迁移向导：列出所有账号，用户分别选择源和目标"""
     all_uids = get_all_user_ids()
     session_counts = get_session_counts()
     memory_sizes = get_memory_sizes()
     connector_info = get_connector_info()
 
-    print("=" * 70)
-    print("WorkBuddy 账号迁移向导")
-    print("=" * 70)
-    print(f"\n当前登录: {current_uid}\n")
-
     if len(all_uids) <= 1:
         print("⚠️  只发现一个账号，无需迁移。")
         return
 
-    # 列出可迁移的账号
-    other_uids = [u for u in all_uids if u != current_uid]
-    if not other_uids:
-        print("⚠️  没有找到可迁移的其他账号。")
-        return
-
-    print("发现以下可迁移的账号：\n")
-    print(f"  {'序号':<4} {'Sessions':>8} {'Memory':>10} {'Connectors':>12}")
-    print("  " + "-" * 40)
-    for i, uid in enumerate(other_uids, 1):
+    # 显示所有账号
+    def format_uid(uid):
         sc = session_counts.get(uid, 0)
         ms = memory_sizes.get(uid, 0)
         ms_str = f"{ms / 1024:.1f}KB" if ms > 0 else "-"
         ci = connector_info.get(uid, {})
         conn_str = f"{ci.get('mcp_servers', 0)}mcp/{ci.get('connector_states', 0)}conn" if ci else "-"
-        print(f"  {i:<4} {sc:>8} {ms_str:>10} {conn_str:>12}")
+        return sc, ms_str, conn_str
 
-    print()
+    print("=" * 70)
+    print("WorkBuddy 账号迁移向导")
+    print("=" * 70)
+    print("\n请选择迁移方向：先选【目标账号】（接收数据），再选【源账号】（被迁移）\n")
+    print(f"  {'序号':<4} {'user_id':<40} {'Sessions':>8} {'Memory':>10} {'Connectors':>12}")
+    print("  " + "-" * 72)
+    for i, uid in enumerate(all_uids, 1):
+        sc, ms_str, conn_str = format_uid(uid)
+        print(f"  {i:<4} {uid:<40} {sc:>8} {ms_str:>10} {conn_str:>12}")
 
-    # 用户选择
+    print("\n  ⚠️  如果下方「当前登录」显示有误，请忽略，直接按实际登录状态选择。\n")
+
+    # 选目标账号
     while True:
         try:
-            choice = input("请输入要迁移的账号序号（输入 q 取消）: ").strip()
+            choice = input("请选择【目标账号】（接收数据的账号，输入序号）: ").strip()
+            if choice.lower() == "q":
+                print("已取消")
+                return
+            idx = int(choice) - 1
+            if 0 <= idx < len(all_uids):
+                target_uid = all_uids[idx]
+                print(f"  ✅ 目标账号: {target_uid[:20]}... ({session_counts.get(target_uid, 0)} sessions)")
+                break
+            else:
+                print(f"⚠️  无效序号，请输入 1-{len(all_uids)} 之间的数字")
+        except ValueError:
+            print("⚠️  请输入数字或 q")
+        except (EOFError, KeyboardInterrupt):
+            print("\n已取消")
+            return
+
+    # 选源账号（排除目标）
+    other_uids = [u for u in all_uids if u != target_uid]
+    print()
+    print(f"  可迁移到 {target_uid[:20]}... 的源账号：\n")
+    print(f"  {'序号':<4} {'user_id':<40} {'Sessions':>8} {'Memory':>10} {'Connectors':>12}")
+    print("  " + "-" * 72)
+    for i, uid in enumerate(other_uids, 1):
+        sc, ms_str, conn_str = format_uid(uid)
+        print(f"  {i:<4} {uid:<40} {sc:>8} {ms_str:>10} {conn_str:>12}")
+
+    while True:
+        try:
+            choice = input("\n请选择【源账号】（要迁移出的账号，输入序号）: ").strip()
             if choice.lower() == "q":
                 print("已取消")
                 return
@@ -580,8 +639,10 @@ def interactive_migrate():
             print("\n已取消")
             return
 
-    print(f"\n已选择: {source_uid[:20]}... ({session_counts.get(source_uid, 0)} sessions)")
-    migrate(source_uid)
+    print(f"\n  源账号:   {source_uid[:20]}... ({session_counts.get(source_uid, 0)} sessions)")
+    print(f"  目标账号: {target_uid[:20]}... ({session_counts.get(target_uid, 0)} sessions)")
+    print()
+    migrate(source_uid, target_uid=target_uid)
 
 
 def get_task_stats():
@@ -902,6 +963,7 @@ def main():
     parser = argparse.ArgumentParser(description="WorkBuddy 账号迁移工具")
     parser.add_argument("--diagnose", "-d", action="store_true", help="诊断模式：查看所有账号数据分布")
     parser.add_argument("--source", "-s", type=str, help="源账号 user_id（要迁移出的账号）")
+    parser.add_argument("--target", "-t", type=str, help="目标账号 user_id（接收数据的账号，默认从 storage.json 自动推断）")
     parser.add_argument("--yes", "-y", action="store_true", help="跳过确认直接迁移")
     parser.add_argument("--rollback", "-r", type=str, help="回滚到指定备份标签")
     parser.add_argument("--restore-tasks", action="store_true", help="恢复历史任务到当前 session")
@@ -923,7 +985,7 @@ def main():
         else:
             restore_tasks(target_session_id=args.session, skip_confirm=args.yes)
     elif args.source:
-        migrate(args.source, skip_confirm=args.yes)
+        migrate(args.source, target_uid=args.target, skip_confirm=args.yes)
     else:
         # 无参数时进入交互式向导
         interactive_migrate()
