@@ -2,6 +2,8 @@
 
 > CodeBuddy 切换账号后对话历史不见了？数据没丢，一键合并回当前账号。
 
+> 本项目基于 [xiaoliuzhuan666/workbuddy-account-migrate](https://github.com/xiaoliuzhuan666/workbuddy-account-migrate) 改造，将 WorkBuddy 账号迁移工具适配为 **CodeBuddy IDE** 专用版本。核心差异：WorkBuddy 需迁移 Session（SQLite 数据库）+ Memory + Connector，CodeBuddy 需迁移**对话历史（本地目录）** + Memory。
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Platform: macOS | Windows | Linux](https://img.shields.io/badge/Platform-macOS%20%7C%20Windows%20%7C%20Linux-blue.svg)](https://github.com/xiaoliuzhuan666/workbuddy-account-migrate)
 [![Python 3.8+](https://img.shields.io/badge/Python-3.8+-green.svg)](https://www.python.org/)
@@ -263,6 +265,8 @@ A: 可以。storage.json 路径已按平台自动适配（macOS `~/Library/Appli
 ---
 
 <h2 id="english">English</h2>
+
+> This project is a fork of [xiaoliuzhuan666/workbuddy-account-migrate](https://github.com/xiaoliuzhuan666/workbuddy-account-migrate), adapted for **CodeBuddy IDE**. Key difference: WorkBuddy requires migrating Session (SQLite DB) + Memory + Connector; CodeBuddy requires migrating **conversation history (local directories)** + Memory.
 
 ### The Problem
 
