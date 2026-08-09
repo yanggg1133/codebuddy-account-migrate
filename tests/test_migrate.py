@@ -9,6 +9,7 @@ CodeBuddy 账号迁移工具 — pytest 测试套件
 
 import json
 import os
+import sqlite3
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -111,11 +112,37 @@ def _set_all_env(tmp_home):
     _set_env("CODEBUDDY_MIGRATE_BACKUP", str(tmp_home / ".codebuddy" / "migrate_backups"))
     _set_env("CODEBUDDY_MIGRATE_HISTORY_BASE",
              str(tmp_home / "Local" / "CodeBuddyExtension" / "Data"))
+    _set_env("CODEBUDDY_MIGRATE_CN_BASE", str(tmp_home / "AppData" / "CodeBuddy CN"))
 
 
 def _read_memory(dir_path: Path, uid: str) -> str:
     f = dir_path / f"{uid}_memery.md"
     return f.read_text(encoding="utf-8")
+
+
+def _create_cn_db(db_path: Path, sessions):
+    """创建模拟的 CodeBuddy CN 会话数据库
+
+    sessions: [(conversation_id, user_id, title), ...]
+    """
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE ItemTable (key TEXT, value TEXT)")
+    for cid, uid, title in sessions:
+        value = json.dumps({
+            "conversationId": cid,
+            "cwd": "e:/download/test",
+            "userId": uid,
+            "title": title,
+            "status": "Completed",
+            "createdAt": 1770000000000,
+            "updatedAt": 1770000000000,
+        }, ensure_ascii=False)
+        conn.execute("INSERT INTO ItemTable (key, value) VALUES (?, ?)",
+                     (f"session:{cid}", value))
+    conn.commit()
+    conn.close()
+    return db_path
 
 
 def _import_mod():
@@ -554,3 +581,116 @@ class TestMigrate:
         assert "- Existing" in result
         assert "- Old item 1" in result
         assert "- Old item 2" in result
+
+
+# ── 测试：CodeBuddy CN 会话迁移 ──────────────────────────────────────────
+
+
+class TestMigrateCnSessions:
+
+    def test_cn_db_read(self, tmp_home):
+        """CN 会话数据库读取"""
+        cn_base = tmp_home / "AppData" / "CodeBuddy CN"
+        db_path = cn_base / "codebuddy-sessions.vscdb"
+        _create_cn_db(db_path, [
+            ("conv-1", "user-old-111", "First session"),
+            ("conv-2", "user-old-111", "Second session"),
+            ("conv-3", "user-current-000", "Current session"),
+        ])
+        _set_env("CODEBUDDY_MIGRATE_CN_BASE", str(cn_base))
+        _set_env("CODEBUDDY_MIGRATE_STORAGE", str(tmp_home / "AppData" / "CodeBuddy" / "User" / "globalStorage" / "storage.json"))
+        _set_env("CODEBUDDY_MIGRATE_MEMERY", str(tmp_home / ".codebuddy" / "memery"))
+        _set_env("CODEBUDDY_MIGRATE_MCP", str(tmp_home / ".codebuddy" / "mcp.json"))
+        _set_env("CODEBUDDY_MIGRATE_BACKUP", str(tmp_home / ".codebuddy" / "migrate_backups"))
+        mod = _import_mod()
+
+        rows = mod.get_cn_session_rows()
+        assert len(rows) == 3
+
+        uids = mod.get_all_cn_uids()
+        assert "user-old-111" in uids
+        assert "user-current-000" in uids
+
+        counts = mod.get_cn_session_counts()
+        assert counts.get("user-old-111") == 2
+        assert counts.get("user-current-000") == 1
+
+    def test_migrate_cn_sessions(self, tmp_home):
+        """CN 会话迁移：userId 更新"""
+        cn_base = tmp_home / "AppData" / "CodeBuddy CN"
+        db_path = cn_base / "codebuddy-sessions.vscdb"
+        _create_cn_db(db_path, [
+            ("conv-1", "user-old-111", "First"),
+            ("conv-2", "user-old-111", "Second"),
+            ("conv-3", "user-current-000", "Current"),
+        ])
+        _set_env("CODEBUDDY_MIGRATE_CN_BASE", str(cn_base))
+        _set_env("CODEBUDDY_MIGRATE_STORAGE", str(tmp_home / "AppData" / "CodeBuddy" / "User" / "globalStorage" / "storage.json"))
+        _set_env("CODEBUDDY_MIGRATE_MEMERY", str(tmp_home / ".codebuddy" / "memery"))
+        _set_env("CODEBUDDY_MIGRATE_MCP", str(tmp_home / ".codebuddy" / "mcp.json"))
+        _set_env("CODEBUDDY_MIGRATE_BACKUP", str(tmp_home / ".codebuddy" / "migrate_backups"))
+        mod = _import_mod()
+
+        n = mod.migrate_cn_sessions("user-old-111", "user-current-000")
+        assert n == 2
+
+        # 验证迁移后结果
+        counts = mod.get_cn_session_counts()
+        assert counts.get("user-old-111", 0) == 0
+        assert counts.get("user-current-000") == 3
+
+    def test_migrate_cn_sessions_no_db(self, tmp_home, capsys):
+        """CN 数据库不存在时跳过"""
+        cn_base = tmp_home / "AppData" / "CodeBuddy CN"
+        _set_env("CODEBUDDY_MIGRATE_CN_BASE", str(cn_base))
+        _set_env("CODEBUDDY_MIGRATE_STORAGE", str(tmp_home / "AppData" / "CodeBuddy" / "User" / "globalStorage" / "storage.json"))
+        _set_env("CODEBUDDY_MIGRATE_MEMERY", str(tmp_home / ".codebuddy" / "memery"))
+        _set_env("CODEBUDDY_MIGRATE_MCP", str(tmp_home / ".codebuddy" / "mcp.json"))
+        _set_env("CODEBUDDY_MIGRATE_BACKUP", str(tmp_home / ".codebuddy" / "migrate_backups"))
+        mod = _import_mod()
+
+        n = mod.migrate_cn_sessions("user-old-111", "user-current-000")
+        assert n == 0
+
+    def test_cn_sessions_in_diagnose(self, tmp_home, capsys):
+        """诊断输出包含 CN 会话统计"""
+        cn_base = tmp_home / "AppData" / "CodeBuddy CN"
+        _create_cn_db(cn_base / "codebuddy-sessions.vscdb", [
+            ("conv-1", "user-old-111", "Old session"),
+        ])
+        _set_all_env(tmp_home)
+        _set_env("CODEBUDDY_MIGRATE_CN_BASE", str(cn_base))
+        mod = _import_mod()
+
+        mod.diagnose()
+        captured = capsys.readouterr()
+        # 诊断输出应包含 CN 会话列
+        assert "CN会话" in captured.out
+        assert "CodeBuddy CN 会话数据库" in captured.out
+
+    def test_cn_sessions_in_migrate_flow(self, tmp_home, capsys):
+        """完整迁移流程中包含 CN 会话迁移"""
+        memery_dir = tmp_home / ".codebuddy" / "memery"
+        _write_memory(memery_dir, "user-current-000", "# Current")
+        _write_memory(memery_dir, "user-old-111", "# Old")
+        cn_base = tmp_home / "AppData" / "CodeBuddy CN"
+        _create_cn_db(cn_base / "codebuddy-sessions.vscdb", [
+            ("conv-1", "user-old-111", "Old session"),
+            ("conv-2", "user-old-111", "Another old"),
+        ])
+        _set_env("CODEBUDDY_MIGRATE_CN_BASE", str(cn_base))
+        _set_env("CODEBUDDY_MIGRATE_STORAGE", str(tmp_home / "AppData" / "CodeBuddy" / "User" / "globalStorage" / "storage.json"))
+        _set_env("CODEBUDDY_MIGRATE_MEMERY", str(memery_dir))
+        _set_env("CODEBUDDY_MIGRATE_MCP", str(tmp_home / ".codebuddy" / "mcp.json"))
+        _set_env("CODEBUDDY_MIGRATE_BACKUP", str(tmp_home / ".codebuddy" / "migrate_backups"))
+        mod = _import_mod()
+
+        mod.migrate("user-old-111", "user-current-000", skip_confirm=True)
+        captured = capsys.readouterr()
+
+        assert "迁移完成" in captured.out
+        assert "CN 会话" in captured.out
+        # 验证 CN 会话已迁移
+        counts = mod.get_cn_session_counts()
+        assert counts.get("user-old-111", 0) == 0
+        assert counts.get("user-current-000") == 2

@@ -7,7 +7,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Platform: macOS | Windows | Linux](https://img.shields.io/badge/Platform-macOS%20%7C%20Windows%20%7C%20Linux-blue.svg)](https://github.com/xiaoliuzhuan666/workbuddy-account-migrate)
 [![Python 3.8+](https://img.shields.io/badge/Python-3.8+-green.svg)](https://www.python.org/)
-[![Tests](https://img.shields.io/badge/Tests-28%20passed-brightgreen.svg)](https://github.com/xiaoliuzhuan666/workbuddy-account-migrate)
+[![Tests](https://img.shields.io/badge/Tests-33%20passed-brightgreen.svg)](https://github.com/xiaoliuzhuan666/workbuddy-account-migrate)
 
 **[English](#english) | [中文](#chinese)**
 
@@ -152,10 +152,13 @@ CodeBuddy 账号迁移（Memory + 本地对话历史）
 
 | 数据类型 | 存储位置 | 隔离方式 | 是否迁移 | 迁移策略 |
 |:---|:---|:---|:---:|:---|
-| 对话历史 | `%LOCALAPPDATA%\CodeBuddyExtension\Data\{uid}\CodeBuddyIDE\{uid}\history\` | 按 user_id 目录 | ✅ | 会话目录复制，已存在跳过 |
+| 对话历史（英文版） | `%LOCALAPPDATA%\CodeBuddyExtension\Data\{uid}\CodeBuddyIDE\{uid}\history\` | 按 user_id 目录 | ✅ | 会话目录复制，已存在跳过 |
+| 会话索引（CN 中文版） | `%APPDATA%\CodeBuddy CN\codebuddy-sessions.vscdb` | SQLite 记录 userId 字段 | ✅ | UPDATE userId 字段 |
 | 长期记忆 Memory | `~/.codebuddy/memery/{uid}_memery.md` | 按文件名 | ✅ | 追加去重合并（空行对齐） |
 | Connector 连接器 | `~/.codebuddy/mcp.json` | 全局 | ❌ | 全局共享，无需迁移 |
 | Settings / Skills | 全局配置文件 | 无隔离 | ❌ | 全局共享，无需迁移 |
+
+> ⚠️ **CodeBuddy CN（中文版）重要限制**：CN 版是**云端优先架构**，实际对话内容存储在腾讯云服务端（按 userId 隔离）。`codebuddy-sessions.vscdb` 只存本地元数据（标题/状态），本工具只能 UPDATE 本地索引的 userId，**无法改变云端对话所有权**。因此迁移后切换账号可能仍看不到历史——需要用**原始创建账号登录 CN 才能查看**。完整迁移需要调用腾讯云 API（待实现）。英文版不受此限制（历史数据全在本地 `history/` 目录）。
 
 ### 工作原理
 
@@ -208,7 +211,7 @@ codebuddy-account-migrate/
 ├── scripts/
 │   └── migrate.py                         # 核心迁移脚本（零依赖）
 ├── tests/
-│   └── test_migrate.py                    # pytest 测试（28 用例）
+│   └── test_migrate.py                    # pytest 测试（33 用例）
 └── references/
     └── data_isolation_map.md              # 数据隔离全景图
 ```
@@ -246,6 +249,18 @@ A: 可以。storage.json 路径已按平台自动适配（macOS `~/Library/Appli
 - Windows / Linux 实测反馈 → 欢迎 Issue
 
 ### 更新日志
+
+#### v2.1.0 (2026-08-08)
+
+**CodeBuddy CN（中文版）全面支持**
+
+- **新增**：CodeBuddy CN 中文版会话索引迁移（`codebuddy-sessions.vscdb`），支持切换账号后 CN 版对话历史恢复
+- **新增**：`get_cn_session_rows()` / `get_all_cn_uids()` / `get_cn_session_counts()` / `migrate_cn_sessions()` 全套 CN 会话数据库操作
+- **新增**：`CODEBUDDY_MIGRATE_CN_BASE` 环境变量，支持所有路径覆盖，跨平台（macOS / Windows / Linux）
+- **新增**：备份/回滚扩展至 CN 会话数据库（含 WAL/SHM 文件）
+- **新增**：`--diagnose` 增加 CN 会话列，同时显示英文版历史 + 中文版会话
+- **新增**：pytest 测试 5 个新用例，覆盖 CN 会话读取、迁移、备份、诊断、完整流程
+- **测试**：33/33 通过
 
 #### v2.0.0 (2026-08-08)
 
@@ -368,7 +383,7 @@ codebuddy-account-migrate/
 ├── scripts/
 │   └── migrate.py                         # Core migration script (zero deps)
 ├── tests/
-│   └── test_migrate.py                    # pytest suite (28 tests)
+│   └── test_migrate.py                    # pytest suite (33 tests)
 └── references/
     └── data_isolation_map.md              # Data isolation full map
 ```
@@ -377,11 +392,23 @@ codebuddy-account-migrate/
 
 | Platform | Status |
 |:---|:---|
-| Windows | ✅ Tested (C:\Python\Python312, 28 tests passed) |
+| Windows | ✅ Tested (C:\Python\Python312, 33 tests passed) |
 | macOS | ✅ Adapted (paths auto-detected) |
 | Linux | ✅ Adapted (paths auto-detected) |
 
 ### Changelog
+
+#### v2.1.0 (2026-08-08)
+
+**CodeBuddy CN (Chinese version) full support**
+
+- **New**: CodeBuddy CN session index migration (`codebuddy-sessions.vscdb`) — recover conversation history after switching accounts in the Chinese version
+- **New**: `get_cn_session_rows()` / `get_all_cn_uids()` / `get_cn_session_counts()` / `migrate_cn_sessions()` — full CN session DB API
+- **New**: `CODEBUDDY_MIGRATE_CN_BASE` env var for cross-platform path override (macOS / Windows / Linux)
+- **New**: Backup/rollback extended to CN session DB (including WAL/SHM files)
+- **New**: `--diagnose` now shows CN session column alongside English history
+- **New**: 5 new pytest test cases covering CN session read, migration, backup, diagnose, full flow
+- **Tested**: 33/33 passing
 
 #### v2.0.0 (2026-08-08)
 
@@ -396,7 +423,7 @@ codebuddy-account-migrate/
 - **New**: pytest test suite (28 tests) covering memory, history, backup, rollback, diagnose, full flow
 - **Improved**: Memory dedup preserves blank lines and multi-line sections
 - **Improved**: Windows GBK encoding detection, skip stdout wrapping in pytest
-- **Tested**: 28/28 passing on Windows C:\Python\Python312
+- **Tested**: 33/33 passing on Windows C:\Python\Python312
 
 ### License
 

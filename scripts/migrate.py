@@ -119,6 +119,32 @@ HISTORY_BASE = _path_from_env(
 )
 
 
+# CodeBuddy CN（中文版）根目录
+# Windows: %APPDATA%\CodeBuddy CN
+# macOS: ~/Library/Application Support/CodeBuddy CN
+# Linux: ~/.config/CodeBuddy CN
+def _default_cn_base():
+    system = platform.system()
+    if system == "Windows":
+        appdata = os.environ.get("APPDATA", "")
+        if appdata:
+            return Path(appdata) / "CodeBuddy CN"
+        return Path.home() / "AppData" / "Roaming" / "CodeBuddy CN"
+    elif system == "Darwin":
+        return Path.home() / "Library" / "Application Support" / "CodeBuddy CN"
+    else:
+        config_home = os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
+        return Path(config_home) / "CodeBuddy CN"
+
+CODEBUDDY_CN_BASE = _path_from_env(
+    "CODEBUDDY_MIGRATE_CN_BASE",
+    _default_cn_base,
+)
+
+# CodeBuddy CN 会话数据库
+CN_SESSIONS_DB = CODEBUDDY_CN_BASE / "codebuddy-sessions.vscdb"
+
+
 def _history_dir(uid):
     """返回指定 user_id 的本地对话历史目录"""
     return HISTORY_BASE / uid / "CodeBuddyIDE" / uid / "history"
@@ -248,6 +274,112 @@ def get_history_sessions(uid):
     return sessions
 
 
+# ── CodeBuddy CN（中文版）会话数据库 ─────────────────────────────────────
+#
+# ⚠️ 重要限制：CodeBuddy CN 是云端优先架构
+# ────────────────────────────────────────────────────────────────
+# genie-history/ 中的对话文件是 0B 空壳（CN 退出时删除），实际对话内容
+# 存储在腾讯云服务端。codebuddy-sessions.vscdb 只存本地元数据（标题/状态）。
+#
+# 本工具的 CN 迁移（migrate_cn_sessions）只能修改本地 sessions DB 的
+# userId，无法改变云端对话所有权。因此：
+#   - 迁移后切换账号：CN 从云端拉取对话列表时，云端返回当前账号的对话
+#   - 若云端对话仍属旧账号，CN 不显示
+#   - 要查看历史对话，需登录原始创建账号
+#
+# 真正实现 CN 版完整迁移需要调用腾讯云 API（暂未实现）。
+# ────────────────────────────────────────────────────────────────
+
+
+def _cn_db_conn(db_path=None):
+    """打开 CodeBuddy CN 会话数据库连接"""
+    db = db_path or CN_SESSIONS_DB
+    if not Path(db).exists():
+        return None
+    return sqlite3.connect(str(db))
+
+
+def get_cn_session_rows(db_path=None):
+    """读取 CodeBuddy CN 会话数据库的所有 session:* 行
+
+    返回 [(key, value_json_dict), ...]
+    """
+    conn = _cn_db_conn(db_path)
+    if conn is None:
+        return []
+    rows = []
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT key, value FROM ItemTable WHERE key LIKE 'session:%'")
+        for k, v in cur.fetchall():
+            try:
+                rows.append((k, json.loads(v)))
+            except Exception:
+                pass
+    finally:
+        conn.close()
+    return rows
+
+
+def get_all_cn_uids(db_path=None):
+    """扫描 CodeBuddy CN 会话数据库中的所有 user_id"""
+    uids = set()
+    for _, data in get_cn_session_rows(db_path):
+        uid = data.get("userId", "")
+        if uid:
+            uids.add(uid)
+    return sorted(uids)
+
+
+def get_cn_session_counts(db_path=None):
+    """统计 CodeBuddy CN 会话数据库中每个 user_id 的会话数"""
+    counts = {}
+    for _, data in get_cn_session_rows(db_path):
+        uid = data.get("userId", "")
+        if uid:
+            counts[uid] = counts.get(uid, 0) + 1
+    return counts
+
+
+def migrate_cn_sessions(source_uid, target_uid, db_path=None):
+    """迁移 CodeBuddy CN 会话数据库：把源账号的 session 记录 userId 改为目标账号
+
+    对每个 session:* 行，若 value.userId == source_uid，则改为 target_uid。
+    返回迁移的记录数。
+    """
+    db = db_path or CN_SESSIONS_DB
+    if not Path(db).exists():
+        print(f"  ⏭️  CodeBuddy CN 会话数据库不存在，跳过: {db}")
+        return 0
+
+    conn = sqlite3.connect(str(db))
+    migrated = 0
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT key, value FROM ItemTable WHERE key LIKE 'session:%'")
+        updates = []
+        for k, v in cur.fetchall():
+            try:
+                data = json.loads(v)
+            except Exception:
+                continue
+            if data.get("userId", "") == source_uid:
+                data["userId"] = target_uid
+                updates.append((k, json.dumps(data, ensure_ascii=False)))
+        for k, v in updates:
+            cur.execute("UPDATE ItemTable SET value=? WHERE key=?", (v, k))
+        conn.commit()
+        migrated = len(updates)
+    finally:
+        # 确保 WAL 落盘
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception:
+            pass
+        conn.close()
+    return migrated
+
+
 # ── 诊断 ─────────────────────────────────────────────────────────────────
 
 
@@ -257,25 +389,28 @@ def diagnose():
     all_uids = get_all_user_ids()
     memory_sizes = get_memory_sizes()
     history_counts = get_history_counts()
+    cn_counts = get_cn_session_counts()
 
     print("=" * 70)
     print("CodeBuddy 账号数据诊断")
     print("=" * 70)
     print(f"\n当前登录: {current_uid}\n")
 
-    # 合并所有 user_id（memory + history）
-    all_accounts = sorted(set(all_uids) | set(history_counts.keys()))
+    # 合并所有 user_id（memory + history + CN sessions）
+    all_accounts = sorted(set(all_uids) | set(history_counts.keys()) | set(cn_counts.keys()))
 
-    print(f"{'user_id':<40} {'Memory':>10} {'History':>8} {'当前':>4}")
-    print("-" * 66)
+    print(f"{'user_id':<40} {'Memory':>10} {'History':>8} {'CN会话':>8} {'当前':>4}")
+    print("-" * 74)
 
     for uid in all_accounts:
         ms = memory_sizes.get(uid, 0)
         ms_str = f"{ms / 1024:.1f}KB" if ms > 0 else "-"
         hc = history_counts.get(uid, 0)
         hc_str = f"{hc} 会话" if hc > 0 else "-"
+        cc = cn_counts.get(uid, 0)
+        cc_str = f"{cc} 会话" if cc > 0 else "-"
         is_current = "✅" if uid == current_uid else ""
-        print(f"{uid:<40} {ms_str:>10} {hc_str:>8} {is_current:>4}")
+        print(f"{uid:<40} {ms_str:>10} {hc_str:>8} {cc_str:>8} {is_current:>4}")
 
     print(f"\n总计: {len(all_accounts)} 个账号")
 
@@ -283,6 +418,8 @@ def diagnose():
     print(f"\n全局文件（不按 user_id 隔离，无需迁移）:")
     print(f"  mcp.json:   {'✅ 存在' if MCP_JSON.exists() else '❌ 不存在'}")
     print(f"  storage.json: {'✅ 存在' if STORAGE_JSON.exists() else '❌ 不存在'}")
+    print(f"\nCodeBuddy CN 会话数据库:")
+    print(f"  {CN_SESSIONS_DB}: {'✅ 存在' if CN_SESSIONS_DB.exists() else '❌ 不存在'}")
 
     if len(all_accounts) <= 1:
         print("\n⚠️  只发现一个账号，无需迁移。")
@@ -290,15 +427,18 @@ def diagnose():
 
     other_uids = [u for u in all_accounts if u != current_uid]
     if other_uids:
-        print("\n💡 迁移建议（Memory + 本地对话历史）:")
+        print("\n💡 迁移建议（Memory + 本地对话历史 + CN 会话）:")
         for uid in other_uids:
             ms = memory_sizes.get(uid, 0)
             hc = history_counts.get(uid, 0)
+            cc = cn_counts.get(uid, 0)
             parts = []
             if ms > 0:
                 parts.append(f"{ms / 1024:.1f}KB memory")
             if hc > 0:
                 parts.append(f"{hc} 个会话历史")
+            if cc > 0:
+                parts.append(f"{cc} 个 CN 会话")
             print(f"   {uid[:20]}... → 当前账号 ({', '.join(parts)})")
         print(f"\n   执行命令: python migrate.py --source {other_uids[0]}")
 
@@ -330,6 +470,16 @@ def create_backup(target_uid, timestamp):
     if MCP_JSON.exists():
         shutil.copy2(str(MCP_JSON), str(backup_path / "mcp.json"))
         print(f"  ✅ 已备份 mcp.json")
+
+    # 备份 CodeBuddy CN 会话数据库
+    if CN_SESSIONS_DB.exists():
+        shutil.copy2(str(CN_SESSIONS_DB), str(backup_path / "codebuddy-sessions.vscdb"))
+        # 同时备份 WAL/SHM（若存在）
+        for suffix in ("-wal", "-shm"):
+            f = Path(str(CN_SESSIONS_DB) + suffix)
+            if f.exists():
+                shutil.copy2(str(f), str(backup_path / f"codebuddy-sessions.vscdb{suffix}"))
+        print(f"  ✅ 已备份 CodeBuddy CN 会话数据库")
 
     # 写入元数据
     meta = {
@@ -445,14 +595,17 @@ def migrate(source_uid, target_uid=None, skip_confirm=False):
     print("📊 Phase 1: 诊断数据分布...")
     memory_sizes = get_memory_sizes()
     history_counts = get_history_counts()
+    cn_counts = get_cn_session_counts()
     src_memory = memory_sizes.get(source_uid, 0)
     tgt_memory = memory_sizes.get(target_uid, 0)
     src_history = history_counts.get(source_uid, 0)
     tgt_history = history_counts.get(target_uid, 0)
-    print(f"  源账号: {src_memory / 1024:.1f}KB memory, {src_history} 个会话历史")
-    print(f"  目标账号: {tgt_memory / 1024:.1f}KB memory, {tgt_history} 个会话历史")
+    src_cn = cn_counts.get(source_uid, 0)
+    tgt_cn = cn_counts.get(target_uid, 0)
+    print(f"  源账号: {src_memory / 1024:.1f}KB memory, {src_history} 个会话历史, {src_cn} 个 CN 会话")
+    print(f"  目标账号: {tgt_memory / 1024:.1f}KB memory, {tgt_history} 个会话历史, {tgt_cn} 个 CN 会话")
 
-    if src_memory == 0 and src_history == 0:
+    if src_memory == 0 and src_history == 0 and src_cn == 0:
         print("\n⚠️  源账号无 Memory 也无对话历史，无需迁移")
         return
 
@@ -473,6 +626,13 @@ def migrate(source_uid, target_uid=None, skip_confirm=False):
     if src_history > 0:
         print("\n  [对话历史迁移]")
         migrate_history(source_uid, target_uid)
+    if src_cn > 0:
+        print("\n  [CodeBuddy CN 会话迁移]")
+        n = migrate_cn_sessions(source_uid, target_uid)
+        if n > 0:
+            print(f"  ✅ 迁移 {n} 个 CN 会话记录 → {target_uid[:12]}...")
+        else:
+            print(f"  ⏭️  CN 会话无需迁移")
 
     # 验证
     print("\n✅ Phase 4: 验证...")
@@ -483,6 +643,8 @@ def migrate(source_uid, target_uid=None, skip_confirm=False):
     print(f"  目标账号 Memory: {tgt_memory / 1024:.1f}KB → {new_size / 1024:.1f}KB")
     new_hc = len(get_history_sessions(target_uid))
     print(f"  目标账号 对话历史: {tgt_history} → {new_hc} 个会话")
+    new_cn = get_cn_session_counts().get(target_uid, 0)
+    print(f"  目标账号 CN 会话: {tgt_cn} → {new_cn} 个会话")
 
     print("\n" + "=" * 70)
     print("迁移完成！")
@@ -543,6 +705,18 @@ def rollback(backup_tag):
     if mcp_backup.exists() and MCP_JSON.exists():
         shutil.copy2(str(mcp_backup), str(MCP_JSON))
         print("  ✅ 已恢复 mcp.json")
+
+    # 恢复 CodeBuddy CN 会话数据库
+    cn_backup = backup_path / "codebuddy-sessions.vscdb"
+    if cn_backup.exists() and CN_SESSIONS_DB.exists():
+        shutil.copy2(str(cn_backup), str(CN_SESSIONS_DB))
+        # 恢复 WAL/SHM
+        for suffix in ("-wal", "-shm"):
+            f = backup_path / f"codebuddy-sessions.vscdb{suffix}"
+            if f.exists():
+                dst = Path(str(CN_SESSIONS_DB) + suffix)
+                shutil.copy2(str(f), str(dst))
+        print("  ✅ 已恢复 CodeBuddy CN 会话数据库")
 
     print("\n  ⚠️  请重启 CodeBuddy 让变更生效！")
 
